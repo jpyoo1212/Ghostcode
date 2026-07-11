@@ -111,14 +111,14 @@ participants — a third join attempt gets **"This room is full."**
   public anon key (`NEXT_PUBLIC_SUPABASE_ANON_KEY`, safe to expose).
 - **Encrypted backup**: every message is also persisted as ciphertext to the
   `room_messages` table so a reconnecting participant can restore history.
-  Rows expire after 3 minutes (`ROOM_MESSAGE_TTL_SECONDS`), matching the
-  self-destruct behavior in the UI. **Destroy Chat** deletes them immediately
-  and broadcasts the clear to the other participant in real time.
+  Rows expire after 24 hours (`ROOM_MESSAGE_TTL_SECONDS`) so reconnects can
+  restore recent chat. **Destroy Chat** deletes them immediately and broadcasts
+  the clear to the other participant in real time.
 - **Sessions**: creating/joining returns an opaque per-participant token
   (`creator_token` / `joiner_token`), stored in the browser's
-  `sessionStorage`. It's what lets a refresh reconnect without re-entering
-  the Secret Room Key, and it's what every message/backup API call is
-  authorized against (`src/lib/rooms/server-auth.ts`).
+  local storage. It's what lets a browser reopen the last room without
+  re-entering the Secret Room Key, and it's what every message/backup API call
+  is authorized against (`src/lib/rooms/server-auth.ts`).
 
 Run the additions in [`supabase/schema.sql`](./supabase/schema.sql) (the
 `rooms` and `room_messages` tables) in the Supabase SQL editor, and add

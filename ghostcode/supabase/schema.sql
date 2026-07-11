@@ -72,6 +72,6 @@ alter table room_messages enable row level security;
 --   '* * * * *',
 --   $$
 --     delete from room_messages where expires_at < now();
---     delete from rooms where last_active_at < now() - interval '2 hours';
+--     delete from rooms where last_active_at < now() - interval '24 hours';
 --   $$
 -- );

@@ -12,21 +12,17 @@ import { WaitingScreen } from "@/components/room/waiting-screen";
 import { MessageBubble, type ChatMessage, type MessageStatus } from "@/components/room/message-bubble";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { deriveRoomKey, encryptText, decryptText } from "@/lib/crypto/room-crypto";
-import { ROOM_MESSAGE_TTL_SECONDS } from "@/lib/rooms/constants";
+import { ROOM_MESSAGE_RETENTION_LABEL, ROOM_MESSAGE_TTL_SECONDS } from "@/lib/rooms/constants";
+import {
+  getRoomSession,
+  removeRoomSession,
+  saveRoomSession,
+  type StoredRoomSession,
+} from "@/lib/rooms/client-storage";
 import type { RoomRole, RoomMessageRecord } from "@/lib/rooms/types";
 import { cn } from "@/lib/cn";
 
-interface RoomSession {
-  token: string;
-  role: RoomRole;
-  secretKey: string;
-}
-
 type Phase = "loading" | "invalid" | "waiting" | "connecting" | "connected" | "peer-offline";
-
-function sessionKey(roomCode: string) {
-  return `ghostcode-room:${roomCode.toUpperCase()}`;
-}
 
 function otherRole(role: RoomRole): RoomRole {
   return role === "creator" ? "joiner" : "creator";
@@ -37,7 +33,7 @@ export default function RoomChatPage() {
   const router = useRouter();
   const roomCode = (params.code ?? "").toUpperCase();
 
-  const [session, setSession] = useState<RoomSession | null>(null);
+  const [session, setSession] = useState<StoredRoomSession | null>(null);
   const [phase, setPhase] = useState<Phase>("loading");
   const [justConnected, setJustConnected] = useState(false);
   const [peerTyping, setPeerTyping] = useState(false);
@@ -55,16 +51,12 @@ export default function RoomChatPage() {
   // ---- Load session (or bounce to join screen) ----
   useEffect(() => {
     if (!roomCode) return;
-    try {
-      const raw = sessionStorage.getItem(sessionKey(roomCode));
-      if (!raw) {
-        router.replace(`/room?join=${roomCode}`);
-        return;
-      }
-      setSession(JSON.parse(raw) as RoomSession);
-    } catch {
+    const savedSession = getRoomSession(roomCode);
+    if (!savedSession) {
       router.replace(`/room?join=${roomCode}`);
+      return;
     }
+    setSession(savedSession);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode]);
 
@@ -80,13 +72,14 @@ export default function RoomChatPage() {
 
       if (!res.ok) {
         if (!cancelled) {
-          sessionStorage.removeItem(sessionKey(roomCode));
+          removeRoomSession(roomCode);
           router.replace(`/room?join=${roomCode}`);
         }
         return;
       }
 
       cryptoKeyRef.current = await deriveRoomKey(session.secretKey, roomCode);
+      saveRoomSession(roomCode, session);
 
       const historyRes = await fetch(`/api/rooms/${roomCode}/messages`, {
         headers: { "x-room-token": session.token },
@@ -206,7 +199,7 @@ export default function RoomChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session, roomCode]);
 
-  // ---- Self-destruct sweep: drop messages older than the TTL, client-side ----
+  // ---- Keep the UI aligned with the server-side encrypted backup retention. ----
   useEffect(() => {
     const interval = setInterval(() => {
       const cutoff = Date.now() - ROOM_MESSAGE_TTL_SECONDS * 1000;
@@ -360,7 +353,8 @@ export default function RoomChatPage() {
           <div ref={scrollRef} className="mt-4 flex-1 space-y-3 overflow-y-auto pr-1 no-scrollbar" style={{ maxHeight: "58vh" }}>
             {messages.length === 0 && (
               <p className="mt-10 text-center text-sm text-ink-700">
-                No messages yet — say hello. Messages self-destruct after 3 minutes.
+                No messages yet. Messages stay available for{" "}
+                {ROOM_MESSAGE_RETENTION_LABEL} or until Destroy Chat.
               </p>
             )}
             {messages.map((message) => (
