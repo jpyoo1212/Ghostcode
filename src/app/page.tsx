@@ -58,27 +58,6 @@ export default function HomePage() {
               </div>
             </Card>
           </Link>
-
-          <Link href="/room">
-            <Card className="group cursor-pointer transition-colors hover:border-signal-violet/50">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <p className="font-display text-lg font-semibold text-ink-100">
-                      Create a private room
-                    </p>
-                    <span className="rounded-full bg-signal-gradient-soft px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-signal-violet">
-                      New
-                    </span>
-                  </div>
-                  <p className="mt-1 text-sm text-ink-500">
-                    Live, end-to-end encrypted chat for two.
-                  </p>
-                </div>
-                <Arrow />
-              </div>
-            </Card>
-          </Link>
         </div>
       </div>
 

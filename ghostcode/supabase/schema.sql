@@ -32,3 +32,46 @@ alter table secrets enable row level security;
 --   '* * * * *',
 --   $$ delete from secrets where expires_at < now() $$
 -- );
+
+-- =========================================================
+-- Private Room feature (added on top of the existing schema)
+-- =========================================================
+
+create table if not exists rooms (
+  id             uuid primary key default gen_random_uuid(),
+  room_code      text not null unique,
+  key_hash       text not null,
+  creator_token  text not null unique,
+  joiner_token   text unique,
+  created_at     timestamptz not null default now(),
+  last_active_at timestamptz not null default now()
+);
+
+create index if not exists idx_rooms_room_code on rooms (room_code);
+
+create table if not exists room_messages (
+  id          uuid primary key default gen_random_uuid(),
+  room_id     uuid not null references rooms(id) on delete cascade,
+  ciphertext  text not null,
+  iv          text not null,
+  sender_role text not null,
+  created_at  timestamptz not null default now(),
+  expires_at  timestamptz not null
+);
+
+create index if not exists idx_room_messages_room_id on room_messages (room_id);
+create index if not exists idx_room_messages_expires_at on room_messages (expires_at);
+
+alter table rooms enable row level security;
+alter table room_messages enable row level security;
+
+-- Optional: purge expired rooms/messages every minute (requires pg_cron).
+-- create extension if not exists pg_cron;
+-- select cron.schedule(
+--   'ghostcode-purge-expired-rooms',
+--   '* * * * *',
+--   $$
+--     delete from room_messages where expires_at < now();
+--     delete from rooms where last_active_at < now() - interval '2 hours';
+--   $$
+-- );
