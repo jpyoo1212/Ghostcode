@@ -94,6 +94,37 @@ src/
 supabase/schema.sql           Database schema + RLS + optional pg_cron cleanup
 ```
 
+## Private Room (live, end-to-end encrypted chat for two)
+
+`/room` lets one person create a room (`POST /api/rooms`), which generates a
+public **Room ID** and a secret **Secret Room Key**, and a second person join
+(`POST /api/rooms/[code]/join`) by entering both. A room only ever admits two
+participants — a third join attempt gets **"This room is full."**
+
+- **End-to-end encryption**: both browsers derive the same AES-256-GCM key
+  from the Secret Room Key via PBKDF2 (`src/lib/crypto/room-crypto.ts`). The
+  key is derived locally and never transmitted. The server only ever stores
+  ciphertext, and has no way to decrypt it.
+- **Live delivery**: messages, typing indicators, and online/offline status
+  use Supabase Realtime **Broadcast** and **Presence** — a direct pub/sub
+  channel between the two browsers (`room:<ROOM_ID>`), authenticated with the
+  public anon key (`NEXT_PUBLIC_SUPABASE_ANON_KEY`, safe to expose).
+- **Encrypted backup**: every message is also persisted as ciphertext to the
+  `room_messages` table so a reconnecting participant can restore history.
+  Rows expire after 24 hours (`ROOM_MESSAGE_TTL_SECONDS`) so reconnects can
+  restore recent chat. **Destroy Chat** deletes them immediately and broadcasts
+  the clear to the other participant in real time.
+- **Sessions**: creating/joining returns an opaque per-participant token
+  (`creator_token` / `joiner_token`), stored in the browser's
+  local storage. It's what lets a browser reopen the last room without
+  re-entering the Secret Room Key, and it's what every message/backup API call
+  is authorized against (`src/lib/rooms/server-auth.ts`).
+
+Run the additions in [`supabase/schema.sql`](./supabase/schema.sql) (the
+`rooms` and `room_messages` tables) in the Supabase SQL editor, and add
+`NEXT_PUBLIC_SUPABASE_ANON_KEY` (Project Settings → API → anon/public key) to
+your environment variables alongside the existing three.
+
 ## Extending it
 
 The code is deliberately modular so the features below can be added without
