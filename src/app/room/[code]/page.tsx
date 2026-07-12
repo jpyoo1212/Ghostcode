@@ -48,7 +48,79 @@ export default function RoomChatPage() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const everConnectedRef = useRef(false);
 
+  // Pulls the encrypted backup from the server, decrypts it, and merges it
+  // into whatever's already on screen (by id, keeping the richer local
+  // status like "seen" if we have it). This is what makes reconnects
+  // trustworthy: the live broadcast channel is fast but best-effort — if a
+  // message arrives while a tab is backgrounded/suspended (common on
+  // mobile) or during a brief drop, this backfills it instead of it just
+  // being gone until a manual refresh.
+  const refreshHistory = useCallback(async () => {
+    if (!session || !cryptoKeyRef.current) return;
+
+    try {
+      const historyRes = await fetch(`/api/rooms/${roomCode}/messages`, {
+        headers: { "x-room-token": session.token },
+      });
+      if (!historyRes.ok) return;
+
+      const { messages: records } = (await historyRes.json()) as { messages: RoomMessageRecord[] };
+      const decrypted: ChatMessage[] = [];
+
+      for (const record of records) {
+        try {
+          const text = await decryptText(record.ciphertext, record.iv, cryptoKeyRef.current);
+          decrypted.push({
+            id: record.id,
+            text,
+            mine: record.senderRole === session.role,
+            createdAt: new Date(record.createdAt).getTime(),
+            status: "delivered",
+          });
+        } catch {
+          // Skip messages that fail to decrypt (e.g. a corrupted row).
+        }
+      }
+
+      setMessages((prev) => {
+        const byId = new Map(prev.map((m) => [m.id, m] as const));
+        for (const incoming of decrypted) {
+          const existing = byId.get(incoming.id);
+          byId.set(incoming.id, existing ? { ...incoming, status: existing.status } : incoming);
+        }
+        return [...byId.values()].sort((a, b) => a.createdAt - b.createdAt);
+      });
+    } catch {
+      // Best-effort background sync — a transient failure here shouldn't
+      // interrupt the live chat, the next trigger will try again.
+    }
+  }, [session, roomCode]);
+
+  const refreshHistoryRef = useRef(refreshHistory);
+  useEffect(() => {
+    refreshHistoryRef.current = refreshHistory;
+  }, [refreshHistory]);
+
+  // Re-sync whenever the tab becomes visible again — covers phones where
+  // the browser suspends background tabs and may silently drop realtime
+  // events while the person was in another app.
+  useEffect(() => {
+    function handleVisibility() {
+      if (document.visibilityState === "visible") refreshHistoryRef.current?.();
+    }
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, []);
+
   // ---- Load session (or bounce to join screen) ----
+  // Phase is seeded here, synchronously, the moment we know the role — not
+  // after any network call. This is the ONLY place that sets a "guess"
+  // phase; from here on, the realtime presence effect is the sole owner of
+  // phase transitions. That split used to be blurred (the history-loading
+  // effect also set phase after its fetches resolved), which raced against
+  // presence and could silently stomp a correct "connected" back to
+  // "waiting" — the bug behind "shows waiting even though my friend is on,
+  // only a refresh fixes it."
   useEffect(() => {
     if (!roomCode) return;
     const savedSession = getRoomSession(roomCode);
@@ -57,6 +129,7 @@ export default function RoomChatPage() {
       return;
     }
     setSession(savedSession);
+    setPhase(savedSession.role === "creator" ? "waiting" : "connecting");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode]);
 
@@ -81,31 +154,7 @@ export default function RoomChatPage() {
       cryptoKeyRef.current = await deriveRoomKey(session.secretKey, roomCode);
       saveRoomSession(roomCode, session);
 
-      const historyRes = await fetch(`/api/rooms/${roomCode}/messages`, {
-        headers: { "x-room-token": session.token },
-      });
-
-      if (historyRes.ok && !cancelled) {
-        const { messages: records } = (await historyRes.json()) as { messages: RoomMessageRecord[] };
-        const decrypted: ChatMessage[] = [];
-        for (const record of records) {
-          try {
-            const text = await decryptText(record.ciphertext, record.iv, cryptoKeyRef.current);
-            decrypted.push({
-              id: record.id,
-              text,
-              mine: record.senderRole === session.role,
-              createdAt: new Date(record.createdAt).getTime(),
-              status: "delivered",
-            });
-          } catch {
-            // Skip messages that fail to decrypt (e.g. corrupted row).
-          }
-        }
-        setMessages(decrypted);
-      }
-
-      if (!cancelled) setPhase(session.role === "creator" ? "waiting" : "connecting");
+      if (!cancelled) await refreshHistoryRef.current?.();
     })();
 
     return () => {
@@ -118,6 +167,10 @@ export default function RoomChatPage() {
     if (!session || !roomCode) return;
 
     const supabase = getSupabaseBrowserClient();
+    let cancelled = false;
+    let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+    let retryCount = 0;
+
     const channel = supabase.channel(`room:${roomCode}`, {
       config: { presence: { key: session.role } },
     });
@@ -132,6 +185,7 @@ export default function RoomChatPage() {
           if (prev !== "connected") {
             setJustConnected(true);
             setTimeout(() => setJustConnected(false), 2200);
+            refreshHistoryRef.current?.();
           }
           everConnectedRef.current = true;
           return "connected";
@@ -187,12 +241,43 @@ export default function RoomChatPage() {
         setTimeout(() => setDestroyedNotice(false), 3000);
       })
       .subscribe(async (status) => {
+        if (cancelled) return;
+
         if (status === "SUBSCRIBED") {
+          retryCount = 0;
           await channel.track({ role: session.role, online: true });
+          // Presence sync should fire on its own after tracking, but check
+          // once immediately too — this is what makes reconnects feel
+          // instant instead of depending on an event that might be a beat
+          // late.
+          updatePresence();
+          return;
+        }
+
+        // CHANNEL_ERROR / TIMED_OUT / CLOSED can happen on flaky networks,
+        // tab throttling, or a brief Supabase hiccup. Instead of leaving the
+        // UI stuck (which is what used to force a manual refresh), retry
+        // with a short backoff a few times.
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          if (retryCount >= 5) return;
+          retryCount += 1;
+          retryTimeout = setTimeout(() => {
+            if (!cancelled) channel.subscribe();
+          }, Math.min(1000 * retryCount, 4000));
         }
       });
 
+    // Safety net: re-derive phase from the locally cached presence state
+    // every few seconds. This is a pure local read (no network call), so
+    // it's essentially free — but it means even a missed or out-of-order
+    // presence event self-corrects within a few seconds on its own,
+    // instead of requiring the person to refresh the page.
+    const presenceSafetyNet = setInterval(updatePresence, 3000);
+
     return () => {
+      cancelled = true;
+      if (retryTimeout) clearTimeout(retryTimeout);
+      clearInterval(presenceSafetyNet);
       channel.untrack();
       supabase.removeChannel(channel);
     };
