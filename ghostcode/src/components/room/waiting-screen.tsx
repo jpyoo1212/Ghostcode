@@ -1,6 +1,7 @@
 "use client";
 
 import { CopyButton } from "@/components/copy-button";
+import { encodeJoinCode, buildInviteLink } from "@/lib/rooms/join-code";
 
 export function WaitingScreen({
   roomCode,
@@ -9,6 +10,9 @@ export function WaitingScreen({
   roomCode: string;
   secretKey: string;
 }) {
+  const joinCode = encodeJoinCode(roomCode, secretKey);
+  const inviteLink = buildInviteLink(roomCode, secretKey);
+
   return (
     <div className="flex flex-1 flex-col items-center justify-center px-6 py-16 text-center">
       <div className="relative mb-6 h-16 w-16">
@@ -22,22 +26,22 @@ export function WaitingScreen({
         Waiting for your friend…
       </h1>
       <p className="mt-2 max-w-xs text-sm text-ink-500">
-        Invite your friend using the Room ID and Secret Key below. Nothing
-        starts until they join.
+        Send either one below — a tap on the link joins instantly, or they
+        can paste the code. Nothing starts until they open it.
       </p>
 
-      <div className="mt-8 w-full max-w-xs space-y-4">
+      <div className="mt-8 w-full max-w-xs space-y-3">
         <div className="rounded-2xl border border-void-600 bg-void-900/80 p-4 text-left">
-          <p className="text-xs uppercase tracking-wide text-ink-700">Room ID</p>
-          <p className="mt-1 font-mono text-lg tracking-wider text-gradient">{roomCode}</p>
+          <p className="text-xs uppercase tracking-wide text-ink-700">Invite link</p>
+          <p className="mt-1 truncate font-mono text-sm text-ink-100">{inviteLink}</p>
         </div>
-        <CopyButton value={roomCode} />
+        <CopyButton value={inviteLink} label="Copy link" variant="primary" className="w-full" />
 
         <div className="rounded-2xl border border-void-600 bg-void-900/80 p-4 text-left">
-          <p className="text-xs uppercase tracking-wide text-ink-700">Secret Room Key</p>
-          <p className="mt-1 break-all font-mono text-sm text-ink-100">{secretKey}</p>
+          <p className="text-xs uppercase tracking-wide text-ink-700">Join code</p>
+          <p className="mt-1 break-all font-mono text-sm text-gradient">{joinCode}</p>
         </div>
-        <CopyButton value={secretKey} />
+        <CopyButton value={joinCode} label="Copy code" variant="secondary" className="w-full" />
       </div>
     </div>
   );

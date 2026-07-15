@@ -19,13 +19,50 @@ import {
   saveRoomSession,
   type StoredRoomSession,
 } from "@/lib/rooms/client-storage";
-import type { RoomRole, RoomMessageRecord } from "@/lib/rooms/types";
+import type { RoomRole, RoomMessageRecord, SessionResponse } from "@/lib/rooms/types";
 import { cn } from "@/lib/cn";
 
 type Phase = "loading" | "invalid" | "waiting" | "connecting" | "connected" | "peer-offline";
 
 function otherRole(role: RoomRole): RoomRole {
   return role === "creator" ? "joiner" : "creator";
+}
+
+/**
+ * Messages are encrypted as JSON (`{ text, replyTo? }`) rather than raw
+ * text, so a reply can carry a snippet of the quoted message inside the
+ * same end-to-end encrypted envelope. `replyTo.senderRole` is stored (not
+ * "mine") because that's only meaningful from a single viewer's
+ * perspective — each side resolves it to "mine" independently when
+ * decrypting. Anything that isn't valid JSON (e.g. an old plain-text
+ * message from before this existed) is treated as plain text as-is.
+ */
+function parseMessageWire(
+  raw: string,
+  viewerRole: RoomRole
+): { text: string; replyTo?: ChatMessage["replyTo"] } {
+  try {
+    const parsed = JSON.parse(raw) as {
+      text?: unknown;
+      replyTo?: { id?: unknown; text?: unknown; senderRole?: unknown };
+    };
+    if (typeof parsed.text === "string") {
+      let replyTo: ChatMessage["replyTo"];
+      const r = parsed.replyTo;
+      if (r && typeof r.id === "string" && typeof r.text === "string") {
+        const senderRole = r.senderRole === "creator" || r.senderRole === "joiner" ? r.senderRole : undefined;
+        replyTo = { id: r.id, text: r.text, mine: senderRole ? senderRole === viewerRole : false };
+      }
+      return { text: parsed.text, replyTo };
+    }
+  } catch {
+    // Not JSON — must be a plain-text message from before replies existed.
+  }
+  return { text: raw };
+}
+
+function buildMessageWire(text: string, replyTo: { id: string; text: string; senderRole: RoomRole } | null): string {
+  return JSON.stringify(replyTo ? { text, replyTo } : { text });
 }
 
 export default function RoomChatPage() {
@@ -39,6 +76,7 @@ export default function RoomChatPage() {
   const [peerTyping, setPeerTyping] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
+  const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
   const [confirmingDestroy, setConfirmingDestroy] = useState(false);
   const [destroyedNotice, setDestroyedNotice] = useState(false);
 
@@ -47,6 +85,23 @@ export default function RoomChatPage() {
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const everConnectedRef = useRef(false);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const seenAckedIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  // Tells the sender a message has been seen. Safe to call repeatedly for
+  // the same id — it only actually broadcasts once per message per device,
+  // via seenAckedIdsRef, so wiring this up from multiple trigger points
+  // (a live message arriving, history loading, the tab regaining focus)
+  // can't spam duplicate acks.
+  const ackSeen = useCallback((id: string, viewerRole: RoomRole) => {
+    if (seenAckedIdsRef.current.has(id)) return;
+    seenAckedIdsRef.current.add(id);
+    channelRef.current?.send({ type: "broadcast", event: "seen", payload: { id, role: viewerRole } });
+  }, []);
 
   // Pulls the encrypted backup from the server, decrypts it, and merges it
   // into whatever's already on screen (by id, keeping the richer local
@@ -69,14 +124,18 @@ export default function RoomChatPage() {
 
       for (const record of records) {
         try {
-          const text = await decryptText(record.ciphertext, record.iv, cryptoKeyRef.current);
+          const raw = await decryptText(record.ciphertext, record.iv, cryptoKeyRef.current);
+          const mine = record.senderRole === session.role;
+          const { text, replyTo } = parseMessageWire(raw, session.role);
           decrypted.push({
             id: record.id,
             text,
-            mine: record.senderRole === session.role,
+            replyTo,
+            mine,
             createdAt: new Date(record.createdAt).getTime(),
             status: "delivered",
           });
+          if (!mine && document.visibilityState === "visible") ackSeen(record.id, session.role);
         } catch {
           // Skip messages that fail to decrypt (e.g. a corrupted row).
         }
@@ -94,23 +153,92 @@ export default function RoomChatPage() {
       // Best-effort background sync — a transient failure here shouldn't
       // interrupt the live chat, the next trigger will try again.
     }
-  }, [session, roomCode]);
+  }, [session, roomCode, ackSeen]);
 
   const refreshHistoryRef = useRef(refreshHistory);
   useEffect(() => {
     refreshHistoryRef.current = refreshHistory;
   }, [refreshHistory]);
 
+  // The single place that flips the UI into "connected". Realtime Presence
+  // calls this the moment it sees the peer. The polling fallback below
+  // calls this too, independently, in case Presence never fires at all
+  // (misconfiguration, a websocket that silently never reconnects, etc.).
+  // Whichever signal arrives first wins — the guard just prevents the
+  // "just connected" banner from re-firing on every subsequent call.
+  const markConnected = useCallback(() => {
+    setPhase((prev) => {
+      if (prev !== "connected") {
+        setJustConnected(true);
+        setTimeout(() => setJustConnected(false), 2200);
+        refreshHistoryRef.current?.();
+      }
+      everConnectedRef.current = true;
+      return "connected";
+    });
+  }, []);
+
   // Re-sync whenever the tab becomes visible again — covers phones where
   // the browser suspends background tabs and may silently drop realtime
-  // events while the person was in another app.
+  // events while the person was in another app. Also catches up "seen"
+  // acks for anything that arrived while the tab was backgrounded (a
+  // message can only be marked seen once someone's actually looking).
   useEffect(() => {
     function handleVisibility() {
-      if (document.visibilityState === "visible") refreshHistoryRef.current?.();
+      if (document.visibilityState !== "visible" || !session) return;
+      refreshHistoryRef.current?.();
+      for (const m of messagesRef.current) {
+        if (!m.mine) ackSeen(m.id, session.role);
+      }
     }
     document.addEventListener("visibilitychange", handleVisibility);
     return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, []);
+  }, [session, ackSeen]);
+
+  // ---- Fallback connection check (independent of Realtime Presence) ----
+  // Presence is the fast, live path for "is my friend online right now."
+  // But it depends on a websocket handshake succeeding end-to-end, and if
+  // that's ever misconfigured or silently fails, someone can get stuck on
+  // "Connecting to your friend…" forever with no way out but to keep
+  // refreshing. This polls the plain REST session endpoint instead — no
+  // websocket involved — and the moment the server confirms both people
+  // have joined the room, it opens the chat regardless of what Presence is
+  // doing. Once connected once, this stops polling and Presence alone
+  // handles live online/offline after that.
+  useEffect(() => {
+    if (!session || !roomCode) return;
+
+    let cancelled = false;
+    let interval: ReturnType<typeof setInterval> | null = null;
+
+    async function poll() {
+      if (cancelled || everConnectedRef.current) {
+        if (interval) clearInterval(interval);
+        return;
+      }
+      try {
+        const res = await fetch(`/api/rooms/${roomCode}/session`, {
+          headers: { "x-room-token": session!.token },
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as SessionResponse;
+        if (data.status === "ok" && data.roomFull) {
+          markConnected();
+          if (interval) clearInterval(interval);
+        }
+      } catch {
+        // Transient network hiccup — the next tick will try again.
+      }
+    }
+
+    poll();
+    interval = setInterval(poll, 2000);
+
+    return () => {
+      cancelled = true;
+      if (interval) clearInterval(interval);
+    };
+  }, [session, roomCode, markConnected]);
 
   // ---- Load session (or bounce to join screen) ----
   // Phase is seeded here, synchronously, the moment we know the role — not
@@ -125,7 +253,7 @@ export default function RoomChatPage() {
     if (!roomCode) return;
     const savedSession = getRoomSession(roomCode);
     if (!savedSession) {
-      router.replace(`/room?join=${roomCode}`);
+      router.replace("/room");
       return;
     }
     setSession(savedSession);
@@ -146,7 +274,7 @@ export default function RoomChatPage() {
       if (!res.ok) {
         if (!cancelled) {
           removeRoomSession(roomCode);
-          router.replace(`/room?join=${roomCode}`);
+          router.replace("/room");
         }
         return;
       }
@@ -180,22 +308,14 @@ export default function RoomChatPage() {
       const state = channel.presenceState();
       const peerPresent = Object.prototype.hasOwnProperty.call(state, otherRole(session!.role));
 
-      setPhase((prev) => {
-        if (peerPresent) {
-          if (prev !== "connected") {
-            setJustConnected(true);
-            setTimeout(() => setJustConnected(false), 2200);
-            refreshHistoryRef.current?.();
-          }
-          everConnectedRef.current = true;
-          return "connected";
-        }
-        return everConnectedRef.current
-          ? "peer-offline"
-          : session!.role === "creator"
-          ? "waiting"
-          : "connecting";
-      });
+      if (peerPresent) {
+        markConnected();
+        return;
+      }
+
+      setPhase((prev) =>
+        everConnectedRef.current ? "peer-offline" : session!.role === "creator" ? "waiting" : "connecting"
+      );
     }
 
     channel
@@ -205,10 +325,11 @@ export default function RoomChatPage() {
       .on("broadcast", { event: "message" }, async ({ payload }) => {
         if (!cryptoKeyRef.current) return;
         try {
-          const text = await decryptText(payload.ciphertext, payload.iv, cryptoKeyRef.current);
+          const raw = await decryptText(payload.ciphertext, payload.iv, cryptoKeyRef.current);
+          const { text, replyTo } = parseMessageWire(raw, session!.role);
           setMessages((prev) => [
             ...prev,
-            { id: payload.id, text, mine: false, createdAt: Date.now(), status: "delivered" },
+            { id: payload.id, text, replyTo, mine: false, createdAt: Date.now(), status: "delivered" },
           ]);
           channel.send({
             type: "broadcast",
@@ -216,7 +337,7 @@ export default function RoomChatPage() {
             payload: { id: payload.id, role: session!.role },
           });
           if (document.visibilityState === "visible") {
-            channel.send({ type: "broadcast", event: "seen", payload: { id: payload.id, role: session!.role } });
+            ackSeen(payload.id, session!.role);
           }
         } catch {
           // Ignore messages we can't decrypt.
@@ -321,14 +442,27 @@ export default function RoomChatPage() {
     const text = draft.trim();
     if (!text || !session || !cryptoKeyRef.current) return;
 
+    const replyContext = replyingTo
+      ? {
+          id: replyingTo.id,
+          text: replyingTo.text,
+          senderRole: replyingTo.mine ? session.role : otherRole(session.role),
+        }
+      : null;
+    const replyPreview: ChatMessage["replyTo"] = replyingTo
+      ? { id: replyingTo.id, text: replyingTo.text, mine: replyingTo.mine }
+      : undefined;
+
     setDraft("");
+    setReplyingTo(null);
     sendTyping(false);
 
-    const { ciphertext, iv } = await encryptText(text, cryptoKeyRef.current);
+    const wire = buildMessageWire(text, replyContext);
+    const { ciphertext, iv } = await encryptText(wire, cryptoKeyRef.current);
     const tempId = `local-${Date.now()}`;
     setMessages((prev) => [
       ...prev,
-      { id: tempId, text, mine: true, createdAt: Date.now(), status: "sending" },
+      { id: tempId, text, replyTo: replyPreview, mine: true, createdAt: Date.now(), status: "sending" },
     ]);
 
     try {
@@ -435,7 +569,14 @@ export default function RoomChatPage() {
             </div>
           )}
 
-          <div ref={scrollRef} className="mt-4 flex-1 space-y-3 overflow-y-auto pr-1 no-scrollbar" style={{ maxHeight: "58vh" }}>
+          <div
+            ref={scrollRef}
+            className={cn(
+              "mt-4 flex-1 space-y-3 overflow-y-auto pr-1 no-scrollbar transition-[filter,opacity] duration-500",
+              isPaused && "pointer-events-none select-none blur-sm opacity-50"
+            )}
+            style={{ maxHeight: "58vh" }}
+          >
             {messages.length === 0 && (
               <p className="mt-10 text-center text-sm text-ink-700">
                 No messages yet. Messages stay available for{" "}
@@ -443,7 +584,7 @@ export default function RoomChatPage() {
               </p>
             )}
             {messages.map((message) => (
-              <MessageBubble key={message.id} message={message} />
+              <MessageBubble key={message.id} message={message} onReply={setReplyingTo} />
             ))}
             {peerTyping && (
               <div className="flex justify-start">
@@ -452,7 +593,25 @@ export default function RoomChatPage() {
             )}
           </div>
 
-          <div className="mt-4 flex items-center gap-2 rounded-2xl border border-void-600 bg-void-800/60 p-2">
+          {replyingTo && (
+            <div className="mt-3 flex items-center gap-2 rounded-2xl border border-void-600 bg-void-800/80 py-2 pl-3 pr-2 animate-fade-up">
+              <div className="min-w-0 flex-1 border-l-2 border-signal-violet/60 pl-2.5">
+                <p className="text-[11px] font-medium text-signal-violet">
+                  Replying to {replyingTo.mine ? "yourself" : "your friend"}
+                </p>
+                <p className="truncate text-xs text-ink-500">{replyingTo.text}</p>
+              </div>
+              <button
+                onClick={() => setReplyingTo(null)}
+                aria-label="Cancel reply"
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-ink-500 hover:bg-void-700 hover:text-ink-100"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          <div className="mt-3 flex items-center gap-2 rounded-2xl border border-void-600 bg-void-800/60 p-2">
             <EmojiPicker onSelect={(emoji) => handleDraftChange(draft + emoji)} />
             <input
               value={draft}

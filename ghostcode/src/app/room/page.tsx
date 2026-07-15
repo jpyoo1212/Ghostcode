@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Logo } from "@/components/logo";
 import { Card } from "@/components/ui/card";
@@ -15,6 +15,7 @@ import {
   saveRoomSession,
   type RoomHistoryEntry,
 } from "@/lib/rooms/client-storage";
+import { resolveJoinInput } from "@/lib/rooms/join-code";
 import type { CreateRoomResponse, JoinRoomResponse } from "@/lib/rooms/types";
 
 type Tab = "create" | "join";
@@ -22,16 +23,17 @@ type Tab = "create" | "join";
 function RoomLandingInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const prefillCode = normalizeRoomCode(searchParams.get("join") ?? "");
+  const joinParam = searchParams.get("j") ?? "";
 
-  const [tab, setTab] = useState<Tab>(prefillCode ? "join" : "create");
+  const [tab, setTab] = useState<Tab>(joinParam ? "join" : "create");
   const [creating, setCreating] = useState(false);
   const [joining, setJoining] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [autoJoining, setAutoJoining] = useState(Boolean(joinParam));
 
-  const [roomCode, setRoomCode] = useState(prefillCode);
-  const [secretKey, setSecretKey] = useState("");
+  const [joinInput, setJoinInput] = useState(joinParam);
   const [recentRooms, setRecentRooms] = useState<RoomHistoryEntry[]>([]);
+  const autoJoinAttempted = useRef(false);
 
   useEffect(() => {
     setRecentRooms(getRoomHistory());
@@ -89,18 +91,21 @@ function RoomLandingInner() {
     }
   }
 
-  async function handleJoin() {
-    const code = normalizeRoomCode(roomCode);
-    const key = secretKey.trim();
-    if (!code || !key || joining) return;
+  async function handleJoin(rawInput?: string) {
+    const input = (rawInput ?? joinInput).trim();
+    if (!input || joining) return;
+
+    const resolved = resolveJoinInput(input);
+    if (!resolved) {
+      setError("That doesn't look like a valid invite link or join code.");
+      return;
+    }
+    const { roomCode: code, secretKey: key } = resolved;
 
     setJoining(true);
     setError(null);
 
     try {
-      const resumed = await resumeSavedRoom(code);
-      if (resumed) return;
-
       const res = await fetch(`/api/rooms/${encodeURIComponent(code)}/join`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -118,14 +123,19 @@ function RoomLandingInner() {
           saveRoomSession(code, { token: data.token, role: data.role, secretKey: key });
           router.push(`/room/${code}`);
           return;
-        case "room_full":
-          setError("This room is full.");
+        case "room_full": {
+          // We might already be this room's joiner from an earlier visit
+          // (e.g. reopening after clearing a tab). If we have a saved
+          // session for this exact room, resume it instead of hard-failing.
+          const resumed = await resumeSavedRoom(code);
+          if (!resumed) setError("This room is full.");
           return;
+        }
         case "invalid_key":
           setError("Incorrect Secret Room Key.");
           return;
         case "not_found":
-          setError("No room found with that Room ID.");
+          setError("No room found with that invite.");
           return;
       }
     } catch {
@@ -133,6 +143,32 @@ function RoomLandingInner() {
     } finally {
       setJoining(false);
     }
+  }
+
+  // Arrived via a tapped invite link (?j=...) — join automatically instead
+  // of making them paste the code back in manually.
+  useEffect(() => {
+    if (!joinParam || autoJoinAttempted.current) return;
+    autoJoinAttempted.current = true;
+    (async () => {
+      await handleJoin(joinParam);
+      setAutoJoining(false);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joinParam]);
+
+  if (autoJoining) {
+    return (
+      <main className="mx-auto flex min-h-screen w-full max-w-lg flex-col items-center justify-center px-6 text-center">
+        <div className="relative mb-6 h-14 w-14">
+          <div className="absolute inset-0 animate-ping rounded-full bg-signal-violet/30" />
+          <div className="relative grid h-14 w-14 place-items-center rounded-full bg-signal-gradient text-xl shadow-glow">
+            🔒
+          </div>
+        </div>
+        <p className="text-sm text-ink-500">Joining your friend&apos;s room…</p>
+      </main>
+    );
   }
 
   return (
@@ -210,8 +246,8 @@ function RoomLandingInner() {
         {tab === "create" ? (
           <Card className="mt-6">
             <p className="text-sm text-ink-500">
-              We&apos;ll generate a Room ID and a Secret Room Key. Share both
-              with your friend — they&apos;ll need both to join.
+              We&apos;ll generate an invite link and a join code. Share
+              either one with your friend — both get them in.
             </p>
             {error && <p className="mt-3 text-xs text-signal-red">{error}</p>}
             <Button onClick={handleCreate} disabled={creating} size="lg" className="mt-4 w-full">
@@ -221,34 +257,23 @@ function RoomLandingInner() {
         ) : (
           <Card className="mt-6 space-y-4">
             <div>
-              <label htmlFor="roomCode" className="mb-1.5 block text-xs uppercase tracking-wide text-ink-700">
-                Room ID
+              <label htmlFor="joinInput" className="mb-1.5 block text-xs uppercase tracking-wide text-ink-700">
+                Invite link or join code
               </label>
-              <input
-                id="roomCode"
-                value={roomCode}
-                onChange={(e) => setRoomCode(e.target.value.toUpperCase())}
-                placeholder="X7K2P9QZ"
+              <textarea
+                id="joinInput"
+                value={joinInput}
+                onChange={(e) => setJoinInput(e.target.value)}
+                placeholder="Paste what your friend sent you"
+                rows={3}
                 autoFocus
-                className="w-full rounded-2xl border border-void-600 bg-void-900/80 p-4 font-mono text-base tracking-wider text-ink-100 placeholder:text-ink-700 focus:border-signal-violet/60"
-              />
-            </div>
-            <div>
-              <label htmlFor="secretKey" className="mb-1.5 block text-xs uppercase tracking-wide text-ink-700">
-                Secret Room Key
-              </label>
-              <input
-                id="secretKey"
-                value={secretKey}
-                onChange={(e) => setSecretKey(e.target.value)}
-                placeholder="Enter the key your friend shared"
-                className="w-full rounded-2xl border border-void-600 bg-void-900/80 p-4 font-mono text-sm text-ink-100 placeholder:text-ink-700 focus:border-signal-violet/60"
+                className="w-full resize-none rounded-2xl border border-void-600 bg-void-900/80 p-4 font-mono text-sm text-ink-100 placeholder:text-ink-700 focus:border-signal-violet/60"
               />
             </div>
             {error && <p className="text-xs text-signal-red">{error}</p>}
             <Button
-              onClick={handleJoin}
-              disabled={!roomCode.trim() || !secretKey.trim() || joining}
+              onClick={() => handleJoin()}
+              disabled={!joinInput.trim() || joining}
               size="lg"
               className="w-full"
             >

@@ -10,6 +10,7 @@ export interface ChatMessage {
   mine: boolean;
   createdAt: number;
   status: MessageStatus;
+  replyTo?: { id: string; text: string; mine: boolean };
 }
 
 function StatusTicks({ status }: { status: MessageStatus }) {
@@ -32,7 +33,17 @@ function StatusTicks({ status }: { status: MessageStatus }) {
   );
 }
 
-export function MessageBubble({ message }: { message: ChatMessage }) {
+function truncate(text: string, max = 90): string {
+  return text.length > max ? `${text.slice(0, max).trimEnd()}…` : text;
+}
+
+export function MessageBubble({
+  message,
+  onReply,
+}: {
+  message: ChatMessage;
+  onReply?: (message: ChatMessage) => void;
+}) {
   return (
     <div
       className={cn(
@@ -40,14 +51,31 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
         message.mine ? "justify-end" : "justify-start"
       )}
     >
-      <div
+      <button
+        type="button"
+        onClick={() => onReply?.(message)}
+        aria-label="Reply to this message"
         className={cn(
-          "max-w-[78%] rounded-3xl px-4 py-2.5 text-[15px] leading-relaxed shadow-sm",
+          "max-w-[78%] rounded-3xl px-4 py-2.5 text-left text-[15px] leading-relaxed shadow-sm transition-transform active:scale-[0.98]",
           message.mine
             ? "rounded-br-md bg-signal-gradient text-white"
             : "rounded-bl-md border border-void-600 bg-void-800 text-ink-100"
         )}
       >
+        {message.replyTo && (
+          <div
+            className={cn(
+              "mb-1.5 rounded-xl border-l-2 px-2.5 py-1.5 text-[13px]",
+              message.mine
+                ? "border-white/50 bg-black/15 text-white/80"
+                : message.replyTo.mine
+                ? "border-signal-violet/60 bg-signal-violet/10 text-ink-300"
+                : "border-void-600 bg-void-900/50 text-ink-500"
+            )}
+          >
+            {truncate(message.replyTo.text, 70)}
+          </div>
+        )}
         <p className="whitespace-pre-wrap break-words">{message.text}</p>
         <div
           className={cn(
@@ -63,7 +91,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
           </span>
           {message.mine && <StatusTicks status={message.status} />}
         </div>
-      </div>
+      </button>
     </div>
   );
 }
